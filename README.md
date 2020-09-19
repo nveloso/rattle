@@ -1,3 +1,11 @@
+# My fork of Rattle
+
+In this fork, I updated the intermediate representation (IR) of Rattle.
+I decided to maintain some PUSH instructions that are related to PHI instructions.
+This way, when symbolic executing, I know the exact location of PUSH instruction, and then, in which path it was declared.
+Also, I added to SSAInstruction class a variable called instruction_offset.
+This variable represents the byte-offset to the start of the range in the source file.
+This will be helpful when trying to map one instruction to the Solidity source file.
 
 # rattle
 
