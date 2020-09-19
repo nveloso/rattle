@@ -35,7 +35,8 @@ class EVMAsm(object):
 
     class EVMInstruction(pyevmasm.Instruction):
         def __init__(self, opcode: int, name: str, operand_size: int, pops: int, pushes: int, fee: int,
-                     description: str, operand: Optional[int] = None, pc: Optional[int] = 0) -> None:
+                     description: str, operand: Optional[int] = None, pc: Optional[int] = 0,
+                     offset: Optional[int] = 0) -> None:
             '''
             This represents an EVM instruction.
             EVMAsm will create this for you.
@@ -76,6 +77,7 @@ class EVMAsm(object):
 
             '''
             super().__init__(opcode, name, operand_size, pops, pushes, fee, description, operand, pc)
+            self._offset = offset
             if operand_size != 0 and operand is not None:
                 mask = (1 << operand_size * 8) - 1
                 if ~mask & operand:
@@ -89,6 +91,10 @@ class EVMAsm(object):
 
         def __hash__(self) -> int:
             return hash((self._opcode, self._pops, self._pushes, self._pc))
+
+        @property
+        def offset(self):
+            return self._offset
 
         @property
         def is_push(self) -> bool:
@@ -115,13 +121,13 @@ class EVMAsm(object):
             return self.semantics in ('AND', 'OR', 'XOR', 'NOT')
 
     @staticmethod
-    def convert_instruction_to_evminstruction(instruction):
+    def convert_instruction_to_evminstruction(instruction, offset):
         return EVMAsm.EVMInstruction(instruction._opcode, instruction._name, instruction._operand_size,
                                      instruction._pops, instruction._pushes, instruction._fee,
-                                     instruction._description, instruction._operand, instruction._pc)
+                                     instruction._description, instruction._operand, instruction._pc, offset)
 
     @staticmethod
-    def assemble_one(assembler: str, pc: int = 0, fork=pyevmasm.DEFAULT_FORK) -> EVMInstruction:
+    def assemble_one(assembler: str, pc: int = 0, fork=pyevmasm.DEFAULT_FORK, offset: int = 0) -> EVMInstruction:
         ''' Assemble one EVM instruction from its textual representation.
 
             :param assembler: assembler code for one instruction
@@ -135,12 +141,12 @@ class EVMAsm(object):
 
         '''
         instruction = pyevmasm.assemble_one(assembler, pc, fork)
-        return EVMAsm.convert_instruction_to_evminstruction(instruction)
+        return EVMAsm.convert_instruction_to_evminstruction(instruction, offset)
 
     @staticmethod
     def convert_multiple_instructions_to_evminstructions(instructions):
-        for i in instructions:
-            yield EVMAsm.convert_instruction_to_evminstruction(i)
+        for offset, i in enumerate(instructions):
+            yield EVMAsm.convert_instruction_to_evminstruction(i, offset)
 
     @staticmethod
     def assemble_all(assembler: str, pc: int = 0, fork=pyevmasm.DEFAULT_FORK) -> Iterable[EVMInstruction]:
@@ -169,7 +175,7 @@ class EVMAsm(object):
         return EVMAsm.convert_multiple_instructions_to_evminstructions(instructions)
 
     @staticmethod
-    def disassemble_one(bytecode: Iterable, pc: int = 0, fork=pyevmasm.DEFAULT_FORK) -> EVMInstruction:
+    def disassemble_one(bytecode: Iterable, pc: int = 0, fork=pyevmasm.DEFAULT_FORK, offset: int = 0) -> EVMInstruction:
         ''' Decode a single instruction from a bytecode
 
             :param bytecode: the bytecode stream
@@ -183,7 +189,7 @@ class EVMAsm(object):
 
         '''
         instruction = pyevmasm.disassemble_one(bytecode, pc, fork)
-        return EVMAsm.convert_instruction_to_evminstruction(instruction)
+        return EVMAsm.convert_instruction_to_evminstruction(instruction, offset)
 
     @staticmethod
     def disassemble_all(bytecode: Iterable, pc: int = 0, fork=pyevmasm.DEFAULT_FORK) -> Iterable[EVMInstruction]:

@@ -10,8 +10,6 @@ from .hashes import hashes
 
 logger = logging.getLogger(__name__)
 
-concrete_values: List['ConcreteStackValue'] = []
-
 
 class NewEdgeException(Exception):
     pass
@@ -92,21 +90,23 @@ class StackValue(object):
 
 
 class ConcreteStackValue(StackValue):
-    def __init__(self, value: int) -> None:
+    def __init__(self, value: int, concrete_values: List['ConcreteStackValue'] = None) -> None:
+        if concrete_values is None:
+            concrete_values = []
         self.concrete_value = int(value)
+        self._concrete_values = concrete_values
         super().__init__(-1)
 
         concrete_values.append(self)
 
     def __del__(self) -> None:
-        concrete_values.remove(self)
+        self._concrete_values.remove(self)
 
     def __repr__(self) -> str:
         return f"#{self.concrete_value:x}"
 
     def __eq__(self, other: object) -> bool:
-        return isinstance(other, ConcreteStackValue) \
-               and self.concrete_value == other.concrete_value
+        return isinstance(other, ConcreteStackValue) and self.concrete_value == other.concrete_value
 
     def __lt__(self, other: 'ConcreteStackValue') -> bool:
         return self.concrete_value < other.concrete_value
@@ -239,6 +239,7 @@ class SSAInstruction(object):
     parent_block: 'SSABasicBlock'
     _return_value: Optional[StackValue]
     comment = None
+    instruction_offset: int
 
     def __init__(self, evminsn: EVMAsm.EVMInstruction, parent_block: 'SSABasicBlock') -> None:
         self.insn = evminsn
@@ -246,6 +247,7 @@ class SSAInstruction(object):
         self._return_value = None
         self.offset = evminsn.pc
         self.parent_block = parent_block
+        self.instruction_offset = evminsn.offset
 
     def __repr__(self) -> str:
         rv: str = ''
@@ -381,15 +383,16 @@ class SSAInstruction(object):
     def replace_uses_with(self, sv: StackValue) -> None:
 
         if self.return_value is None:
-            return
+            return False
 
         for reader in (self.return_value.readers()).copy():
             # Remove duplicates concrete values in phis functions. Ex: phi(#0, %332, #0) became phi(#0, %332)
             if reader.insn.name == 'PHI' and isinstance(sv, ConcreteStackValue):
-                if sv not in reader.arguments:
-                    reader.replace_argument(self.return_value, sv)
-                else:
-                    reader.remove_argument(self.return_value)
+                # if sv not in reader.arguments:
+                #     reader.replace_argument(self.return_value, sv)
+                # else:
+                #     reader.remove_argument(self.return_value)
+                return False
             else:
                 reader.replace_argument(self.return_value, sv)
 
@@ -400,6 +403,7 @@ class SSAInstruction(object):
             self.remove_from_parent()
         except:
             pass
+        return True
 
     def add_comment(self, comment: str) -> None:
         self.comment = comment
@@ -501,11 +505,14 @@ class SSABasicBlock(object):
 
         return new_block
 
-    def set_fallthrough_target(self, other: int) -> None:
-        target_block: SSABasicBlock = self.function.blockmap[other]
+    def set_fallthrough_target(self, other: int) -> bool:
+        target_block: SSABasicBlock = self.function.blockmap.get(other)
+        if target_block is None:
+            return False
 
         self.fallthrough_edge = target_block
         target_block.in_edges.add(self)
+        return True
 
     def clear(self) -> None:
         self.insns = []

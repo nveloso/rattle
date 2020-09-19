@@ -16,6 +16,7 @@ class InternalRecover(object):
     functions: List[SSAFunction]
     edges: List[Tuple[int, int]]
     insns: Dict[int, EVMAsm.EVMInstruction]
+    concrete_values: List['ConcreteStackValue'] = []
 
     def __init__(self, filedata: bytes, edges: List[Tuple[int, int]], optimize=False, split_functions=True) -> None:
         logger.debug(f'{len(filedata)} bytes of input data')
@@ -26,6 +27,7 @@ class InternalRecover(object):
         dispatch = SSAFunction(0)
         self.functions = [dispatch, ]
         self.edges = edges
+        self.concrete_values = []
 
         self.recover(dispatch)
 
@@ -65,7 +67,7 @@ class InternalRecover(object):
         bytecode = bytecode.decode().rstrip()
         # Bail on empty bytecode
         if not bytecode or len(bytecode) <= 2:
-            return bytecode
+            return bytecode.encode()
 
         # Gather length of CBOR metadata from the end of the file
         raw_length = bytecode[-4:]
@@ -73,7 +75,7 @@ class InternalRecover(object):
 
         # Bail on unreasonable values for length (meaning we read something else other than metadata length)
         if length * 2 > len(bytecode) - 4:
-            return bytecode
+            return bytecode.encode()
 
         # Gather what we assume is the CBOR encoded metadata, and try to parse it
         metadata_start = len(bytecode) - length * 2 - 4
@@ -84,7 +86,7 @@ class InternalRecover(object):
             cbor2.loads(binascii.unhexlify(metadata))
         except:
             logger.warning('Error parsing contract metadata. Ignoring.')
-            return bytecode
+            return bytecode.encode()
 
         # Return bytecode without it
         return bytecode[0:metadata_start].encode()
@@ -117,7 +119,7 @@ class InternalRecover(object):
                 if insn.insn.is_push:
                     # Push is special, we keep it around so we know where constants are declared
                     # but we optimize it out later in most cases
-                    insn.append_argument(ConcreteStackValue(insn.insn.operand))
+                    insn.append_argument(ConcreteStackValue(insn.insn.operand, self.concrete_values))
                     insn.return_value = function.new_placeholder_value()
                     block.stack_push(insn.return_value)
                     continue
@@ -199,7 +201,8 @@ class InternalRecover(object):
             terminator: SSAInstruction = block.insns[-1]
 
             if terminator.insn.name == "JUMPI" or not terminator.insn.is_terminator:
-                block.set_fallthrough_target(terminator.offset + terminator.insn.size)
+                if not block.set_fallthrough_target(terminator.offset + terminator.insn.size):
+                    function.blocks.remove(block)
 
     def repopulate_blocks(self, function: SSAFunction) -> None:
         for block in function:
@@ -520,7 +523,7 @@ class InternalRecover(object):
                         dirty |= update
 
     def constant_folder(self) -> None:
-        worklist: List[ConcreteStackValue] = copy.copy(concrete_values)
+        worklist: List[ConcreteStackValue] = copy.copy(self.concrete_values)
 
         two_concrete_arguments = {
             'EXP': lambda x, y: x ** y,
@@ -553,7 +556,7 @@ class InternalRecover(object):
 
                         op = two_concrete_arguments.get(reader.insn.name, None)
                         if op is not None:
-                            do_replace(ConcreteStackValue(op(x, y)))
+                            do_replace(ConcreteStackValue(op(x, y), self.concrete_values))
                     else:
 
                         def one_concrete_argument(symbolic_idx: int, concrete_idx: int) -> None:
@@ -567,7 +570,7 @@ class InternalRecover(object):
                                 do_replace(symbolic_arg)
 
                             if reader.insn.name in ('EXP', 'MUL') and y == 0:
-                                do_replace(ConcreteStackValue(1))
+                                do_replace(ConcreteStackValue(1, self.concrete_values))
 
                         if isinstance(reader.arguments[0], ConcreteStackValue):
                             # Only first argument is concrete
@@ -579,10 +582,10 @@ class InternalRecover(object):
                 if reader.insn.name == 'NOT' and isinstance(reader.arguments[0], ConcreteStackValue):
                     x: int = cast(ConcreteStackValue, reader.arguments[0]).concrete_value
                     do_replace(ConcreteStackValue(
-                        ~x & (0x10000000000000000000000000000000000000000000000000000000000000000 - 1)))
+                        ~x & (0x10000000000000000000000000000000000000000000000000000000000000000 - 1),
+                        self.concrete_values))
 
-                if reader.insn.is_push:
-                    reader.replace_uses_with(item)
+                if reader.insn.is_push and reader.replace_uses_with(item):
                     worklist.append(item)
 
     def peephole_optimizer(self, ssainsn: SSAInstruction) -> bool:
@@ -614,21 +617,6 @@ class InternalRecover(object):
                             sub_reader.replace_uses_with(ssainsn.return_value)
                             return True
 
-        if ssainsn.insn.name in ('CALLER', 'SLOAD', 'CALLDATALOAD', 'MLOAD'):
-            readers = list(ssainsn.return_value.readers())
-            for reader in readers:
-                if reader.insn.name != 'AND':
-                    continue
-
-                other_arg = reader.arguments[1] if reader.arguments[0] == ssainsn.return_value else reader.arguments[0]
-
-                if isinstance(other_arg, ConcreteStackValue):
-                    if other_arg.concrete_value == 0xffffffffffffffffffffffffffffffffffffffff:
-                        # Address mask, let's just remove it
-                        ssainsn.add_comment("ADDRESS")
-                        reader.replace_uses_with(ssainsn.return_value)
-                        return True
-
         '''
         Remove all operations with unused results (assuming no side-effects)
         '''
@@ -648,15 +636,42 @@ class InternalRecover(object):
 
         return True
 
+    def update_jump_offset_of_phi_instruction(self, phi_instruction: SSAInstruction, old_value, new_value):
+        if not isinstance(phi_instruction.insn, PHIInstruction):
+            return
+
+        phis = []
+        for arg in phi_instruction.arguments:
+            if arg.writer.insn.is_push and arg.writer.arguments[0].concrete_value == old_value:
+                arg.writer.replace_argument(arg.writer.arguments[0],
+                                            ConcreteStackValue(new_value, self.concrete_values))
+                return
+            if isinstance(arg.writer.insn, PHIInstruction):
+                phis.append(arg.writer)
+
+        for phi in phis:
+            self.update_jump_offset_of_phi_instruction(phi, old_value, new_value)
+
+    def update_jump_offsets(self, jump_instruction: SSAInstruction, old_value, new_value):
+        if not jump_instruction.insn.is_branch:
+            return
+
+        jump_first_arg = jump_instruction.arguments[0]
+        if isinstance(jump_first_arg, ConcreteStackValue):
+            jump_instruction.replace_argument(jump_first_arg, ConcreteStackValue(new_value, self.concrete_values))
+            return
+
+        phi_instruction = jump_first_arg.writer
+        self.update_jump_offset_of_phi_instruction(phi_instruction, old_value, new_value)
+
     def guarenteed_optimizations(self) -> None:
         # PUSHES are lowered
-        worklist: List[ConcreteStackValue] = copy.copy(concrete_values)
+        worklist: List[ConcreteStackValue] = copy.copy(self.concrete_values)
         while len(worklist) > 0:
             item: ConcreteStackValue = worklist.pop()
 
             for reader in list(item.readers()):
-                if reader.insn.is_push:
-                    reader.replace_uses_with(item)
+                if reader.insn.is_push and reader.replace_uses_with(item):
                     worklist.append(item)
 
         for function in self.functions:
@@ -696,6 +711,7 @@ class InternalRecover(object):
                         elif block in prev_block.jump_edges:
                             prev_block.jump_edges.remove(block)
                             prev_block.jump_edges.add(next_block)
+                            self.update_jump_offsets(prev_block.insns[-1], block.offset, next_block.offset)
 
                         next_block.in_edges.add(prev_block)
 
@@ -734,6 +750,7 @@ class InternalRecover(object):
                     elif block in prev_block.jump_edges:
                         prev_block.jump_edges.remove(block)
                         prev_block.jump_edges.add(next_block)
+                        self.update_jump_offsets(prev_block.insns[-1], block.offset, next_block.offset)
 
                     next_block.in_edges.add(prev_block)
 
